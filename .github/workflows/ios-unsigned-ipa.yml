@@ -1,0 +1,101 @@
+name: Build iOS IPA (unsigned)
+
+# 这个 workflow 只做一件事：
+# 在 GitHub 免费的 macOS 机器上把本仓库编译成 iOS 安装包（.ipa）。
+# 免费 Apple ID 不能在云端做正式签名，所以这里产出的是「未签名 ipa」，
+# 由你或我在 Windows 上用 Sideloadly / AltStore + 免费 Apple ID 现场签名安装。
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ios:
+    name: Build unsigned ipa
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show build environment
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios || true
+          sw_vers
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.2
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      # 本地开发机访问 GitHub release 需要用 ghproxy 代理，
+      # 但 GitHub 的构建机直连 GitHub 更快，所以这里换回官方地址。
+      - name: Point sqlite3 native-asset download at github.com
+        run: |
+          set -euo pipefail
+          sed -i '' 's|https://ghproxy.net/https://github.com/|https://github.com/|g' pubspec.yaml
+          grep -n "url_pattern" pubspec.yaml
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build iOS (release, no codesign)
+        run: flutter build ios --release --no-codesign
+
+      - name: Verify built app
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP"
+          echo "== Info.plist =="
+          plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleDisplayName|CFBundleShortVersionString|CFBundleVersion" || true
+          echo "== nested bundles (should be empty) =="
+          ls -la "$APP/PlugIns" 2>/dev/null || echo "(no PlugIns folder -> OK)"
+
+      - name: Package unsigned ipa
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          rm -rf Payload beecount-ios-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry beecount-ios-unsigned.ipa Payload
+          echo "== ipa contents =="
+          unzip -l beecount-ios-unsigned.ipa | head -20
+          ls -lh beecount-ios-unsigned.ipa
+
+      - name: Upload ipa as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: beecount-ios-unsigned-ipa
+          path: beecount-ios-unsigned.ipa
+          if-no-files-found: error
+
+      # 再发一个 Release，这样不用登录 GitHub 也能直接下载 ipa
+      - name: Publish release with ipa
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-build-${{ github.run_number }}
+          name: iOS unsigned ipa #${{ github.run_number }}
+          prerelease: true
+          body: |
+            云端 macOS 自动编译出来的「未签名」iOS 安装包。
+
+            安装方式（Windows）：
+            1. 用 Sideloadly 或 AltStore 选这个 ipa
+            2. 用免费 Apple ID 签名
+            3. 免费证书 7 天失效，之后用 AltStore/AltServer 自动续签
+          files: beecount-ios-unsigned.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
